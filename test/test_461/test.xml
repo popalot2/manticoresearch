@@ -82,6 +82,188 @@ INSERT INTO test1 (id,extra) VALUES <vals/>
     select id, length(extra) as l, extra from test1 where extra!='' order by id desc /*+ SecondaryIndex(extra) */;
     drop table test1;
 </sphinxql>    
+<!-- MatchByCandidates restricts posting leaves, not the result queue. Paired
+     queries keep matching/weights identical while testing candidate lookup on
+     RAM, disk and mixed chunks. Keep inserts in one transaction so background
+     RAM-segment merging cannot change corpus statistics between paired queries. -->
+<sphinxql>
+    create table candidates (title text, g int, h int) min_word_len='1' morphology='none' stopwords='';
+</sphinxql>
+<var name="candidate_rows"/>
+<repeat count="256" vars="i" init="1" inc="1"><var name="candidate_rows" delimiter=",">(<i/>, 'a z b a b a', 1, 2)</var></repeat>
+<sphinxql skip="1">
+    insert into candidates values <candidate_rows/>,
+        (257, 'a x b', 1, 3), (258, 'q r s', 2, 2),
+        (4294967297, 'a z b a b a', 3, 4),
+        (9223372036854775807, 'a z b a b a', 3, 4);
+</sphinxql>
+<sphinxql>
+    <!-- ID equality alone must activate on RAM, including a row beyond a posting block. -->
+    select id,weight() from candidates where id=128 and match('"a z b"') option threads=1;
+    select id,weight() from candidates where id=128 and match('"a z b"') option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    select id,weight() from candidates where id in (128) and match('"a z b"') option threads=1;
+    select id,weight() from candidates where id in (128) and match('"a z b"') option threads=1 /*+ MatchByCandidates */;
+
+    <!-- Unsorted/duplicate/missing IDs, a phrase-negative row, and 64-bit IDs.
+         The supplied list is not a prefix of the posting list and is not ordered. -->
+    select id,weight() from candidates where id in (4294967297,256,1,256,257,999999,9223372036854775807) and match('"a z b"') order by id asc option threads=1;
+    select id,weight() from candidates where id in (4294967297,256,1,256,257,999999,9223372036854775807) and match('"a z b"') order by id asc option threads=1 /*+ MatchByCandidates */;
+    select id from candidates where id=257 and match('"a z b"') /*+ MatchByCandidates */;
+    select id from candidates where id=999999 and match('a') /*+ MatchByCandidates */;
+    select id from candidates where id=0 and match('a') /*+ MatchByCandidates */;
+    select id from candidates where id in (257,258) and match('"a z b"') /*+ MatchByCandidates */;
+    select id from candidates where id in (1,258,999999) and match('!a') order by id asc option threads=1,not_terms_only_allowed=1 /*+ MatchByCandidates */;
+
+    <!-- LIMIT/max_matches/cutoff apply to matched results, not candidate collection. -->
+    select id from candidates where id in (257,258,4294967297) and match('"a z b"') limit 1 option threads=1,max_matches=1,cutoff=1,max_query_time=0 /*+ MatchByCandidates */;
+    select count(*),sum(id) from candidates where id in (1,32,128,256,257) and match('"a z b"') option threads=1,max_query_time=1000 /*+ MatchByCandidates */;
+
+    <!-- The runtime limit controls fallback; restore the default after each phase. -->
+    show global variables like 'match_by_candidates_limit';
+    set global match_by_candidates_limit=256;
+    select count(*) from candidates where g=1 and match('a') option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    set global match_by_candidates_limit=257;
+    select count(*) from candidates where g=1 and match('a') option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    set global match_by_candidates_limit=65536;
+    flush ramchunk candidates;
+
+    <!-- Disk: ordinary automatic ID lookup, forced lookup, and the ID secondary
+         index must all reach the same candidate rows without reading other hits. -->
+    select id,weight() from candidates where id=128 and match('"a z b"') option threads=1;
+    select id,weight() from candidates where id=128 and match('"a z b"') option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    select id,weight() from candidates where id in (128) and match('"a z b"') option threads=1;
+    select id,weight() from candidates where id in (128) and match('"a z b"') option threads=1 /*+ MatchByCandidates */;
+    set global match_by_candidates_limit=256;
+    select count(*) from candidates where g=1 and match('a') option threads=1 /*+ MatchByCandidates SecondaryIndex(g) */;
+    show meta like 'index';
+    set global match_by_candidates_limit=257;
+    select count(*) from candidates where g=1 and match('a') option threads=1 /*+ MatchByCandidates SecondaryIndex(g) */;
+    show meta like 'index';
+    set global match_by_candidates_limit=65536;
+    select id from candidates where id=9223372036854775807 and match('"a z b"') option threads=1 /*+ MatchByCandidates DocidIndex(id) */;
+    select id,weight() from candidates where id in (4294967297,256,1,256,257,999999,9223372036854775807) and match('"a z b"') order by id asc option threads=1;
+    select id,weight() from candidates where id in (4294967297,256,1,256,257,999999,9223372036854775807) and match('"a z b"') order by id asc option threads=1 /*+ MatchByCandidates DocidIndex(id) */;
+    show meta like 'index';
+    select id,weight() from candidates where id in (4294967297,256,1,256,257,999999,9223372036854775807) and match('"a z b"') order by id asc option threads=1 /*+ MatchByCandidates SecondaryIndex(id) */;
+    show meta like 'index';
+    select id from candidates where id=257 and match('"a z b"') /*+ MatchByCandidates */;
+    select id from candidates where id=999999 and match('a') /*+ MatchByCandidates */;
+    select id from candidates where id in (257,258) and match('"a z b"') /*+ MatchByCandidates */;
+
+    <!-- Disabling both ID access paths is an observable, correct fallback. -->
+    select id from candidates where id in (1,128,256,257) and match('"a z b"') order by id asc option threads=1 /*+ MatchByCandidates No_DocidIndex(id) No_SecondaryIndex(id) */;
+    show meta like 'index';
+
+    <!-- Several secondary indexes contribute to the same candidate intersection;
+         forcing only g leaves h as a residual filter. Empty intersections stay empty. -->
+    select count(*),sum(id) from candidates where g=1 and h=2 and match('"a z b"') option threads=1;
+    select count(*),sum(id) from candidates where g=1 and h=2 and match('"a z b"') option threads=1 /*+ MatchByCandidates SecondaryIndex(g,h) */;
+    show meta like 'index';
+    select count(*),sum(id) from candidates where g=1 and h=2 and match('"a z b"') option threads=1 /*+ MatchByCandidates SecondaryIndex(g) No_SecondaryIndex(h) */;
+    select id from candidates where g=2 and h=4 and match('a') option threads=1 /*+ MatchByCandidates SecondaryIndex(g,h) */;
+    select id,id%2 odd from candidates where g=1 and h=2 and odd=1 and match('"a z b"') order by id asc limit 3 option threads=1 /*+ MatchByCandidates SecondaryIndex(g,h) */;
+
+    <!-- Existing disk IDs can be deleted/replaced while another listed ID is in
+         RAM. Old disk postings must not resurrect either deleted or replaced rows. -->
+    delete from candidates where id=128;
+    replace into candidates values (256,'q r s',2,3),(1000,'a z b a b a',1,2);
+    select id,weight() from candidates where id in (1,128,256,1000,4294967297) and match('"a z b"') order by id asc option threads=1;
+    select id,weight() from candidates where id in (1,128,256,1000,4294967297) and match('"a z b"') order by id asc option threads=1 /*+ MatchByCandidates */;
+    select id from candidates where id=128 and match('a') /*+ MatchByCandidates */;
+    select id from candidates where id=256 and match('a') /*+ MatchByCandidates */;
+    select id from candidates where id=1000 and match('"a z b"') /*+ MatchByCandidates */;
+    select id from candidates where id in (128,256,258,1000) and match('!a') order by id asc option threads=1,not_terms_only_allowed=1 /*+ MatchByCandidates */;
+    flush ramchunk candidates;
+
+    <!-- Each disk chunk has its own row-ID space; the same external ID list must
+         be translated independently after the replacements have been flushed. -->
+    select id,weight() from candidates where id in (1,128,256,1000,4294967297) and match('"a z b"') order by id asc option threads=1;
+    select id,weight() from candidates where id in (1,128,256,1000,4294967297) and match('"a z b"') order by id asc option threads=1 /*+ MatchByCandidates DocidIndex(id) */;
+    select id from candidates where id=1000 and match('"a z b"') /*+ MatchByCandidates */;
+    drop table candidates;
+</sphinxql>
+<!-- Review regressions: user-variable snapshots, quoted JSON hint subkeys,
+     posting checkpoints, wildcard weights, multiple leaf batches and agents. -->
+<sphinxql>
+    create table candidate_review (title text, g int, j json) min_prefix_len='1' morphology='none' access_doclists='file' access_hitlists='file';
+</sphinxql>
+<var name="review_rows"/>
+<repeat count="1024" vars="i" init="1" inc="1"><var name="review_rows" delimiter=",">(<i/>, 'alpha alphabet beta alpha', 1, '{"key":1}')</var></repeat>
+<sphinxql skip="1">insert into candidate_review values <review_rows/>,(2048,'alpha beta',2,'{"key":2}');</sphinxql>
+<sphinxql>
+    set global @candidate_review_ids=(1,33,513,2048);
+    <!-- A user variable alone falls back; a safe AND predicate still narrows;
+         an OR tree containing the variable must remain intact. -->
+    select id from candidate_review where id in @candidate_review_ids and match('alpha beta') order by id asc option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    select id from candidate_review where id in @candidate_review_ids and g=1 and match('alpha beta') order by id asc option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    select id from candidate_review where (id in @candidate_review_ids or g=2) and match('alpha beta') order by id asc option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    select count(*),sum(id) from candidate_review where g=1 and match('al* beta') option threads=1;
+    select count(*),sum(id) from candidate_review where g=1 and match('al* beta') option threads=1 /*+ MatchByCandidates */;
+    flush ramchunk candidate_review;
+
+    <!-- File readers: beta has an inline hit; alpha has multiple hits. Probe
+         both sides of checkpoints, then consume more than one leaf batch. -->
+    select id,weight() from candidate_review where id in (1,32,33,64,65,512,513,1023,1024,2048) and match('alpha beta') order by id asc option threads=1;
+    select id,weight() from candidate_review where id in (1,32,33,64,65,512,513,1023,1024,2048) and match('alpha beta') order by id asc option threads=1 /*+ MatchByCandidates DocidIndex(id) */;
+    select count(*),sum(id) from candidate_review where g=1 and match('alpha beta') option threads=1;
+    select count(*),sum(id) from candidate_review where g=1 and match('alpha beta') option threads=1 /*+ MatchByCandidates */;
+    select id,weight() from candidate_review where id in (1,33,513,2048) and match('al* beta') order by id asc option threads=1;
+    select id,weight() from candidate_review where id in (1,33,513,2048) and match('al* beta') order by id asc option threads=1 /*+ MatchByCandidates */;
+    select count(*),sum(id) from candidate_review where j.key=1 and match('alpha beta') option threads=1 /*+ SecondaryIndex(j.`key`) MatchByCandidates */;
+    select count(*),sum(id) from candidate_review where j.key=1 and match('alpha beta') option threads=1 /*+ MatchByCandidates SecondaryIndex(j.`key`) /* comment */ MatchByCandidates */;
+    alter table candidate_review access_doclists='mmap';
+    alter table candidate_review access_hitlists='mmap';
+</sphinxql>
+<var name="review_mapped_rows"/>
+<repeat count="1024" vars="i" init="4097" inc="1"><var name="review_mapped_rows" delimiter=",">(<i/>, 'alpha alphabet beta alpha', 1, '{"key":1}')</var></repeat>
+<sphinxql skip="1">insert into candidate_review values <review_mapped_rows/>;</sphinxql>
+<sphinxql>
+    insert into candidate_review values (8192,'alpha beta',2,'{"key":2}');
+    <!-- Exercise RAM segment resets alongside the existing disk chunk. The last
+         segment has no g=1 candidates; its wildcard cache must stay empty. -->
+    select count(*),sum(id) from candidate_review where g=1 and match('al* beta') option threads=1;
+    select count(*),sum(id) from candidate_review where g=1 and match('al* beta') option threads=1 /*+ MatchByCandidates */;
+    flush ramchunk candidate_review;
+    <!-- Exercise the newly flushed disk chunk with mmap readers. -->
+    select id,weight() from candidate_review where id in (33,513,4097,4128,4129,4608,4609,5120,8192) and match('alpha beta') order by id asc option threads=1;
+    select id,weight() from candidate_review where id in (33,513,4097,4128,4129,4608,4609,5120,8192) and match('alpha beta') order by id asc option threads=1 /*+ MatchByCandidates DocidIndex(id) */;
+    select id,weight() from candidate_review where id in (33,513,4097,4129,4609,8192) and match('al* beta') order by id asc option threads=1;
+    select id,weight() from candidate_review where id in (33,513,4097,4129,4609,8192) and match('al* beta') order by id asc option threads=1 /*+ MatchByCandidates */;
+
+    create table candidate_agent type='distributed' agent='<agent0_address/>:candidate_review';
+    create table candidate_nested type='distributed' agent='<agent0_address/>:candidate_agent';
+    select id from candidate_agent,candidate_nested where id=33 and match('alpha beta') option threads=1 /*+ MatchByCandidates */;
+    show meta like 'index';
+    drop table candidate_nested;
+    drop table candidate_agent;
+    drop table candidate_review;
+
+    <!-- A distributed search shares iterator metadata across local indexes.
+         Candidate usage must stay at 100%, while old SI entries remain intact. -->
+    create table candidate_meta_a (title text, g int);
+    create table candidate_meta_b (title text, g int);
+    insert into candidate_meta_a values (1,'alpha beta',1);
+    insert into candidate_meta_b values (2,'alpha beta',1);
+    flush ramchunk candidate_meta_a;
+    flush ramchunk candidate_meta_b;
+    insert into candidate_meta_a values (3,'alpha beta',1);
+    flush ramchunk candidate_meta_a;
+    create table candidate_meta_dist type='distributed' local='candidate_meta_a' local='candidate_meta_b';
+    select id from candidate_meta_dist where g=1 and match('alpha') order by id asc option threads=1 /*+ SecondaryIndex(g) */;
+    show meta like 'index';
+    select id from candidate_meta_dist where g=1 and match('alpha') order by id asc option threads=1 /*+ MatchByCandidates SecondaryIndex(g) */;
+    show meta like 'index';
+    drop table candidate_meta_dist;
+    drop table candidate_meta_b;
+    drop table candidate_meta_a;
+</sphinxql>
 </queries>
 
 </test>

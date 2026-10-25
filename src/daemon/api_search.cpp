@@ -42,7 +42,8 @@ enum
 	QFLAG_SIMPLIFY_SET			= 1UL << 14,
 	QFLAG_EXPLICIT_RANKER		= 1UL << 15,
 	QFLAG_EXPLICIT_BOOLEAN_MODE	= 1UL << 16,
-	QFLAG_DEFAULT_BOOL_OR		= 1UL << 17
+	QFLAG_DEFAULT_BOOL_OR		= 1UL << 17,
+	QFLAG_MATCH_BY_CANDIDATES	= 1UL << 18 // explicit opt-in; older agents ignore unknown flag bits
 };
 
 void operator<< ( ISphOutputBuffer & tOut, const CSphNamedInt & tValue )
@@ -110,6 +111,7 @@ void SearchRequestBuilder_c::SendQuery ( const char * sIndexes, ISphOutputBuffer
 	uFlags |= QFLAG_EXPLICIT_RANKER * q.m_bExplicitRanker;
 	uFlags |= QFLAG_EXPLICIT_BOOLEAN_MODE * q.m_bExplicitBooleanMode;
 	uFlags |= QFLAG_DEFAULT_BOOL_OR * q.m_bDefaultBoolOr;
+	uFlags |= QFLAG_MATCH_BY_CANDIDATES * q.m_bMatchByCandidates;
 
 	if ( q.m_eQueryType==QUERY_JSON )
 		uFlags |= QFLAG_JSON_QUERY;
@@ -614,6 +616,31 @@ bool SearchReplyParser_c::ParseReply ( MemInputBuffer_c & tReq, AgentConn_t & tA
 		if ( uStatMask & 4U )
 			tReq.GetUint64(); // was predicted time; removed
 
+		if ( uStatMask & 8U )
+		{
+			// Only upgraded, hinted agents send this execution acknowledgment.
+			tRes.m_tIteratorStats.m_iTotal = tReq.GetInt();
+			int iCount = tReq.GetInt();
+			if ( iCount<0 || iCount>tReq.HasBytes()/12 )
+			{
+				tAgent.m_sFailure = "invalid candidate iterator statistics";
+				return false;
+			}
+			for ( int i=0; i<iCount; ++i )
+			{
+				auto & tDesc = tRes.m_tIteratorStats.m_dIterators.Add();
+				tDesc.m_sAttr = tReq.GetString();
+				tDesc.m_sType = tReq.GetString();
+				tDesc.m_iUsed = tReq.GetInt();
+			}
+			// An acknowledged empty/early-rejected query did no matching work.
+			if ( !tRes.m_tIteratorStats.m_iTotal )
+			{
+				tRes.m_tIteratorStats.m_iTotal = 1;
+				tRes.m_tIteratorStats.m_dIterators.Add ( { "@match", "MatchByCandidatesFallback(no_work)" } );
+			}
+		}
+
 		tRes.m_iAgentFetchedDocs = tReq.GetDword();
 		tRes.m_iAgentFetchedHits = tReq.GetDword();
 		tRes.m_iAgentFetchedSkips = tReq.GetDword();
@@ -991,6 +1018,7 @@ bool ParseSearchQuery ( InputBuffer_c & tReq, ISphOutputBuffer & tOut, CSphQuery
 	{
 		tQuery.m_bExplicitBooleanMode = !!( uFlags & QFLAG_EXPLICIT_BOOLEAN_MODE );
 		tQuery.m_bDefaultBoolOr = !!( uFlags & QFLAG_DEFAULT_BOOL_OR );
+		tQuery.m_bMatchByCandidates = !!( uFlags & QFLAG_MATCH_BY_CANDIDATES );
 	}
 	if ( tQuery.m_eRanker==SPH_RANK_EXPR || tQuery.m_eRanker==SPH_RANK_EXPORT )
 		tQuery.m_sRankerExpr = tReq.GetString();
@@ -1849,7 +1877,9 @@ void SendResult ( int iVer, ISphOutputBuffer & tOut, const AggrResult_t& tRes, b
 
 	if ( iVer>=0x11A && bAgentMode )
 	{
-		BYTE uStatMask = ( g_bCpuStats ? 2U : 0U ) | ( g_bIOStats ? 1U : 0U );
+		// Extend replies only for a master that requested the new flag; replies
+		// to older masters keep their original layout.
+		BYTE uStatMask = ( g_bCpuStats ? 2U : 0U ) | ( g_bIOStats ? 1U : 0U ) | ( tQuery.m_bMatchByCandidates ? 8U : 0U );
 		tOut.SendByte ( uStatMask );
 
 		if ( g_bIOStats )
@@ -1868,6 +1898,18 @@ void SendResult ( int iVer, ISphOutputBuffer & tOut, const AggrResult_t& tRes, b
 		{
 			int64_t iCpuTime = tRes.m_iCpuTime + tRes.m_iAgentCpuTime;
 			tOut.SendUint64 ( iCpuTime );
+		}
+		if ( tQuery.m_bMatchByCandidates )
+		{
+			// Preserve per-chunk active/fallback reasons across distributed merges.
+			tOut.SendInt(tRes.m_tIteratorStats.m_iTotal);
+			tOut.SendInt(tRes.m_tIteratorStats.m_dIterators.GetLength());
+			for ( const auto & tDesc : tRes.m_tIteratorStats.m_dIterators )
+			{
+				tOut.SendString(tDesc.m_sAttr.cstr());
+				tOut.SendString(tDesc.m_sType.cstr());
+				tOut.SendInt(tDesc.m_iUsed);
+			}
 		}
 
 	}

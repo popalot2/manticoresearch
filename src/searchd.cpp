@@ -3138,6 +3138,7 @@ static void AddIOStatsToMeta ( VectorLike & dStatus, const CSphIOStats & tStats,
 		dStatus.Addf ( "%d.%d", (int)( tStats.m_iWriteBytes/1024 ), (int)( tStats.m_iWriteBytes%1024 )/100 );
 }
 
+/// Add query metadata from tMeta to dStatus, including iterator usage; returns nothing.
 void BuildMeta ( VectorLike & dStatus, const CSphQueryResultMeta & tMeta )
 {
 	if ( !tMeta.m_sError.IsEmpty() )
@@ -3183,8 +3184,15 @@ void BuildMeta ( VectorLike & dStatus, const CSphQueryResultMeta & tMeta )
 	}
 
 	StringBuilder_c sIterators { ", " };
+	int iMatchTotal = 0;
 	for ( const auto & i : tMeta.m_tIteratorStats.m_dIterators )
-		sIterators.Appendf ( "%s:%s (%d%%)", i.m_sAttr.cstr(), i.m_sType.cstr(), int(float(i.m_iUsed)/tMeta.m_tIteratorStats.m_iTotal*100.0f) );
+		if ( i.m_sAttr=="@match" )
+			iMatchTotal += i.m_iUsed;
+	for ( const auto & i : tMeta.m_tIteratorStats.m_dIterators )
+	{
+		int iTotal = i.m_sAttr=="@match" ? iMatchTotal : tMeta.m_tIteratorStats.m_iTotal;
+		sIterators.Appendf ( "%s:%s (%d%%)", i.m_sAttr.cstr(), i.m_sType.cstr(), int(float(i.m_iUsed)/iTotal*100.0f) );
+	}
 
 	if ( !sIterators.IsEmpty() )
 		dStatus.MatchTuplet ( "index", sIterators.cstr() );
@@ -9657,6 +9665,8 @@ static void SetCPUStats ( bool bCPUStats = true )
 	SetLogStatsFlags ( g_bIOStats, g_bCpuStats );
 }
 
+/// Apply the named global setting using its numeric/string values; return whether
+/// sName was handled and report invalid values through sError.
 static bool HandleSetGlobal ( CSphString & sError, const CSphString & sName, int64_t iSetValue, CSphString sSetValue )
 {
 	auto& tSess = session::Info();
@@ -9942,6 +9952,11 @@ static bool HandleSetGlobal ( CSphString & sError, const CSphString & sName, int
 	if ( sName == "secondary_indexes" )
 	{
 		SetSecondaryIndexDefault ( iSetValue != 0 ? SIDefault_e::ENABLED : SIDefault_e::DISABLED );
+		return true;
+	}
+	if ( sName == "match_by_candidates_limit" )
+	{
+		SetMatchCandidatesLimit ( iSetValue, sError );
 		return true;
 	}
 
@@ -11125,7 +11140,8 @@ static const char * LogLevelName ( ESphLogLevel eLevel )
 }
 
 // SHOW [GLOBAL|SESSION] VARIABLES WHERE variable_name='xxx' [OR variable_name='xxx']
-// SHOW [GLOBAL|SESSION] VARIABLES WHERE variable_name='xxx' [OR variable_name='xxx']
+/// Write global/session variables selected by tStmt into dRows; returns nothing.
+/// tStmt carries the SHOW filter and whether GLOBAL was requested.
 void HandleMysqlShowVariables ( RowBuffer_i & dRows, const SqlStmt_t & tStmt )
 {
 	VectorLike dTable ( tStmt.m_sStringParam );
@@ -11163,6 +11179,7 @@ void HandleMysqlShowVariables ( RowBuffer_i & dRows, const SqlStmt_t & tStmt )
 
 	dTable.MatchTuplet ( "accurate_aggregation", GetAccurateAggregationDefault() ? "1" : "0" );
 	dTable.MatchTupletf ( "distinct_precision_threshold", "%d", GetDistinctThreshDefault() );
+	dTable.MatchTupletf ( "match_by_candidates_limit", "%d", GetMatchCandidatesLimit() );
 	dTable.MatchTupletFn ( "threads_ex_effective", [] {
 		StringBuilder_c tBuf;
 		auto x = GetEffectiveBaseDispatcherTemplate();
@@ -15813,6 +15830,8 @@ static void ConfigureMerge ( const CSphConfigSection & hSearchd )
 }
 
 
+/// Apply hConf to searchd, using bNeedPIDFile/bTestMode for startup behavior.
+/// Returns nothing; invalid candidate limits and other fatal settings stop startup.
 void ConfigureSearchd ( const CSphConfig & hConf, bool bNeedPIDFile, bool bTestMode ) REQUIRES ( MainThread )
 {
 	if ( !hConf.Exists ( "searchd" ) || !hConf["searchd"].Exists ( "searchd" ) )
@@ -15912,6 +15931,12 @@ void ConfigureSearchd ( const CSphConfig & hConf, bool bNeedPIDFile, bool bTestM
 
 	if ( hSearchd("join_cache_size") )
 		SetJoinCacheSize ( hSearchd.GetSize64 ( "join_cache_size", GetJoinCacheSize() ) );
+	if ( auto * pLimit = hSearchd("match_by_candidates_limit") )
+	{
+		CSphString sError;
+		if ( !SetMatchCandidatesLimit ( pLimit->int64val(), sError ) )
+			sphFatal ( "%s", sError.cstr() );
+	}
 
 	// sha1 password hash for shutdown action
 	SetShutdownToken ( hSearchd.GetStr ( "shutdown_token" ) );

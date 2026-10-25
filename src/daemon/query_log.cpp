@@ -421,7 +421,8 @@ static void AppendHint ( const IndexHint_t & tHint, const StrVec_t & dIndexes, S
 
 static void FormatIndexHints ( const CSphQuery & tQuery, StringBuilder_c & tBuf )
 {
-	if ( !tQuery.m_dIndexHints.GetLength() )
+	// Keep execution hints in replayable SQL even without an index-selection hint.
+	if ( !tQuery.m_dIndexHints.GetLength() && !tQuery.m_bMatchByCandidates )
 		return;
 
 	ScopedComma_c sMatch ( tBuf, nullptr );
@@ -429,6 +430,8 @@ static void FormatIndexHints ( const CSphQuery & tQuery, StringBuilder_c & tBuf 
 	dUsed.ZeroVec();
 
 	tBuf << " /*+ ";
+	if ( tQuery.m_bMatchByCandidates )
+		tBuf << " MatchByCandidates ";
 
 	ARRAY_FOREACH ( i, tQuery.m_dIndexHints )
 	{

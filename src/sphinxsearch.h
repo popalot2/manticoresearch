@@ -52,6 +52,7 @@ struct SkipData_t
 
 class RtIndex_c;
 struct RtGuard_t;
+struct MatchCandidates_t;
 
 /// term, searcher view
 class ISphQword
@@ -128,6 +129,7 @@ public:
 	DictRefPtr_c			m_pDict;
 	mutable KeywordBuf_t	m_tKeywordBuf;
 	bool					m_bHasWideFields { false };
+	MatchCandidates_t *		m_pMatchCandidates { nullptr }; ///< borrowed opt-in state; null leaves normal matching intact
 
 	virtual ~ISphQwordSetup () {}
 
@@ -248,5 +250,45 @@ public:
 	void ScanRegexWords ( const VecTraits_T<RegexTerm_t> & dTerms, const ISphWordlist::Args_t & tArgs, const VecExpandConv_t & dConverters ) const override {}
 
 };
+
+// Query-local candidate rows are sorted, unique and immutable during matching.
+// Row IDs are chunk-local; only a completely collected set may become active.
+struct MatchCandidates_t
+{
+	static constexpr int MAX_ROWS = 65536;
+	static constexpr int MAX_CONFIGURED_ROWS = 524288;
+	CSphVector<RowID_t> m_dRows;
+	int m_iMaxRows = MAX_ROWS; ///< limit sampled once for this search context
+	bool m_bActive = false; ///< false on unsupported/oversized collection: use normal execution
+	bool m_bAborted = false; ///< sticky interruption; never treat a partial prefix as complete
+	bool m_bSequential = false; ///< RAM postings have no skip checkpoints
+	int64_t m_iMaxTimer = 0;
+	CSphString * m_pWarning = nullptr;
+
+	bool Check();
+};
+
+/// Read the per-daemon candidate limit; no parameters, returns a row count.
+int GetMatchCandidatesLimit();
+/// Set the per-daemon limit from iRows; return false and fill sError when out of range.
+bool SetMatchCandidatesLimit ( int64_t iRows, CSphString & sError );
+
+// Independent posting/candidate cursor for each leaf, including RAM readers that
+// cannot return their current posting from AdvanceTo().
+struct MatchCandidateCursor_t
+{
+	MatchCandidates_t * m_pCandidates = nullptr;
+	int m_iNext = 0;
+	RowID_t m_tPosting = INVALID_ROWID;
+
+	void Reset ( MatchCandidates_t * pCandidates );
+	bool Active() const;
+	void Hint ( RowID_t tRowID );
+	RowID_t Next ( ISphQword & tWord, RowID_t tMinRowID = 0 );
+};
+
+class RowidIterator_i;
+std::unique_ptr<RowidIterator_i> BufferMatchCandidates ( std::unique_ptr<RowidIterator_i> pIterator, MatchCandidates_t & tCandidates );
+void DescribeMatchCandidates ( CSphQueryResultMeta & tMeta, const char * sFallback = nullptr );
 
 #endif // _sphinxsearch_

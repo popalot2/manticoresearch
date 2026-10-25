@@ -18,6 +18,7 @@
 #include "coroutine.h"
 #include "secondaryindex.h"
 #include "client_task_info.h"
+#include <atomic>
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -273,6 +274,7 @@ protected:
 	CSphQueryStats *	m_pStats = nullptr;
 	bool				m_bCollectHits = false;
 	RowIdBoundaries_t	m_tBoundaries;
+	MatchCandidateCursor_t m_tCandidates;
 
 	CSphVector<StoredHit_t> m_dStoredHits;
 };
@@ -498,6 +500,7 @@ private:
 		FieldMask_t		m_dQueriedFields;
 		bool			m_bHasWideFields {false};
 		bool			m_bNotWeighted {true};
+		MatchCandidateCursor_t m_tCandidates;
 
 		void			UpdateWideFieldFlag ( const ISphQwordSetup & tSetup );
 		bool			FitsFields() const;
@@ -1492,6 +1495,11 @@ private:
 	void				PopulateCache ( const ISphQwordSetup & tSetup, bool bFillStat );
 	void				FetchHits ( ISphQword * pQword, bool bFillStat );
 	void				FilterHits();
+
+protected:
+	void				FilterCandidates();
+	MatchCandidates_t * m_pCandidates = nullptr;
+	bool m_bCandidatesFiltered = false;
 };
 
 template<bool USE_BM25, bool ROWID_LIMITS>
@@ -1538,12 +1546,18 @@ ExtPayloadBase_T<ROWID_LIMITS>::ExtPayloadBase_T ( const XQNode_t * pNode, const
 	if ( pBoundaries )
 		m_tBoundaries = *pBoundaries;
 
+	m_pCandidates = tSetup.m_pMatchCandidates;
 	PopulateCache ( tSetup, true );
 }
 
+/// Cache hits from pQword; bFillStat preserves the full corpus pass for ranking.
+/// Returns nothing; segment resets skip empty active candidates before searching their vector.
 template<bool ROWID_LIMITS>
 void ExtPayloadBase_T<ROWID_LIMITS>::FetchHits ( ISphQword * pQword, bool bFillStat )
 {
+	if ( !bFillStat && m_pCandidates && m_pCandidates->m_bActive && m_pCandidates->m_dRows.IsEmpty() )
+		return;
+
 	m_dCache.Reserve ( Max ( pQword->m_iHits, pQword->m_iDocs ) );
 
 	while (true)
@@ -1552,9 +1566,20 @@ void ExtPayloadBase_T<ROWID_LIMITS>::FetchHits ( ISphQword * pQword, bool bFillS
 		if ( tMatch.m_tRowID==INVALID_ROWID )
 			break;
 
+		if ( m_pCandidates && !m_pCandidates->Check() )
+			break;
+		// Keep the initial corpus-statistics pass intact for ranking. RAM reset
+		// payloads concatenate expansions, so their row IDs need not be ordered.
+		if ( !bFillStat && m_pCandidates && m_pCandidates->m_bActive
+			&& !std::binary_search ( m_pCandidates->m_dRows.Begin(), m_pCandidates->m_dRows.End(), tMatch.m_tRowID ) )
+			continue;
+
 		pQword->SeekHitlist ( pQword->m_iHitlistPos );
+		int iHitsChecked = 0;
 		for ( Hitpos_t uHit = pQword->GetNextHit(); uHit!=EMPTY_HIT; uHit = pQword->GetNextHit() )
 		{
+			if ( m_pCandidates && !(iHitsChecked++ & 255) && !m_pCandidates->Check() )
+				return;
 			// apply field limits
 			if ( !m_dFieldMask.Test ( HITMAN::GetField(uHit) ) )
 				continue;
@@ -1671,6 +1696,8 @@ void ExtPayloadBase_T<ROWID_LIMITS>::PopulateCache ( const ISphQwordSetup & tSet
 template<bool ROWID_LIMITS>
 void ExtPayloadBase_T<ROWID_LIMITS>::Reset ( const ISphQwordSetup & tSetup )
 {
+	m_pCandidates = tSetup.m_pMatchCandidates;
+	m_bCandidatesFiltered = false;
 	SetMaxTimeout ( tSetup.m_iMaxTimer );
 	m_dCache.Resize ( 0 );
 	PopulateCache ( tSetup, false );
@@ -1766,6 +1793,8 @@ void ExtPayloadBase_T<ROWID_LIMITS>::GetTerms ( const ExtQwordsHash_t & hQwords,
 template <bool USE_BM25, bool ROWID_LIMITS>
 const ExtDoc_t * ExtPayload_T<USE_BM25,ROWID_LIMITS>::GetDocsChunk()
 {
+	if ( BASE::m_pCandidates && BASE::m_pCandidates->m_bActive && !BASE::m_bCandidatesFiltered )
+		BASE::FilterCandidates();
 	// max_query_time
 	if ( BASE::TimeExceeded() )
 	{
@@ -2074,6 +2103,7 @@ inline void ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::Init ( ISphQword * pQword, c
 			if ( m_dQueriedFields[i] )
 				m_bHasWideFields = true;
 	SetMaxTimeout ( tSetup.m_iMaxTimer );
+	m_tCandidates.Reset(tSetup.m_pMatchCandidates);
 
 	if constexpr(STATS)
 	{
@@ -2090,6 +2120,7 @@ ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::ExtTerm_T ( ISphQword * pQword, const IS
 	m_dQueriedFields.SetAll();
 	m_bHasWideFields = tSetup.m_bHasWideFields;
 	SetMaxTimeout( tSetup.m_iMaxTimer );
+	m_tCandidates.Reset(tSetup.m_pMatchCandidates);
 
 	if constexpr ( STATS )
 	{
@@ -2100,6 +2131,7 @@ ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::ExtTerm_T ( ISphQword * pQword, const IS
 template<bool USE_BM25, bool ROWID_LIMITS, bool STATS>
 void ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::Reset ( const ISphQwordSetup & tSetup )
 {
+	m_tCandidates.Reset(tSetup.m_pMatchCandidates);
 	SetMaxTimeout ( tSetup.m_iMaxTimer );
 	m_pQword->Reset ();
 	tSetup.QwordSetup ( m_pQword );
@@ -2152,20 +2184,21 @@ const ExtDoc_t * ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::GetDocsChunk()
 	int iDoc = 0;
 	while ( iDoc<MAX_BLOCK_DOCS-1 )
 	{
-		const CSphMatch & tMatch = m_pQword->GetNextDoc();
+		// Restrict leaf documents before field/position checks and hit collection.
+		RowID_t tRowID = m_tCandidates.Active() ? m_tCandidates.Next(*m_pQword) : m_pQword->GetNextDoc().m_tRowID;
 		if constexpr ( ROWID_LIMITS )
 		{
-			if ( tMatch.m_tRowID<m_tBoundaries.m_tMinRowID )
+			if ( tRowID<m_tBoundaries.m_tMinRowID )
 				continue;
 
-			if ( tMatch.m_tRowID>m_tBoundaries.m_tMaxRowID )
+			if ( tRowID>m_tBoundaries.m_tMaxRowID )
 			{
 				m_pQword->m_iDocs = 0;
 				break;
 			}
 		}
 
-		if ( tMatch.m_tRowID==INVALID_ROWID )
+		if ( tRowID==INVALID_ROWID )
 		{
 			m_pQword->m_iDocs = 0;
 			break;
@@ -2188,7 +2221,7 @@ const ExtDoc_t * ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::GetDocsChunk()
 		}
 
 		ExtDoc_t & tDoc = m_dDocs[iDoc++];
-		tDoc.m_tRowID = tMatch.m_tRowID;
+		tDoc.m_tRowID = tRowID;
 		tDoc.m_uDocFields = m_pQword->m_dQwordFields.GetMask32() & m_dQueriedFields.GetMask32(); // OPTIMIZE: only needed for phrase node
 
 		if_const ( USE_BM25 )
@@ -2336,7 +2369,10 @@ uint64_t ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::GetWordID () const
 template<bool USE_BM25, bool ROWID_LIMITS, bool STATS>
 void ExtTerm_T<USE_BM25,ROWID_LIMITS,STATS>::HintRowID ( RowID_t tRowID )
 {
-	m_pQword->HintRowID ( tRowID );
+	if ( m_tCandidates.Active() )
+		m_tCandidates.Hint(tRowID);
+	else
+		m_pQword->HintRowID ( tRowID );
 
 	if constexpr ( STATS )
 	{
@@ -3072,6 +3108,7 @@ ExtMultiAnd_T<USE_BM25,TEST_FIELDS,ROWID_LIMITS>::ExtMultiAnd_T ( const VecTrait
 		tNode.m_bNotWeighted = tXQNode.m_bNotWeighted;
 		tNode.m_dQueriedFields = tXQNode.m_dSpec.m_dFieldMask;
 		tNode.UpdateWideFieldFlag(tSetup);
+		tNode.m_tCandidates.Reset(tSetup.m_pMatchCandidates);
 	}
 
 	m_dNodes.Sort ( SelectivitySorter_t() );
@@ -3120,9 +3157,10 @@ template <bool USE_BM25,bool TEST_FIELDS,bool ROWID_LIMITS>
 RowID_t ExtMultiAnd_T<USE_BM25,TEST_FIELDS,ROWID_LIMITS>::Advance ( int iNode )
 {
 	NodeInfo_t & tNode = m_dNodes[iNode];
+	// The optimized conjunction bypasses ExtTerm; each word needs its own cursor.
 	do
 	{
-		tNode.m_tRowID = tNode.m_pQword->GetNextDoc().m_tRowID;
+		tNode.m_tRowID = tNode.m_tCandidates.Active() ? tNode.m_tCandidates.Next(*tNode.m_pQword) : tNode.m_pQword->GetNextDoc().m_tRowID;
 	}
 	while ( tNode.m_tRowID!=INVALID_ROWID && !tNode.FitsFields() );
 
@@ -3137,7 +3175,7 @@ RowID_t ExtMultiAnd_T<USE_BM25,TEST_FIELDS,ROWID_LIMITS>::Advance ( int iNode, R
 	if ( tRowID==tNode.m_tRowID )
 		return tRowID;
 
-	tNode.m_tRowID = tNode.m_pQword->AdvanceTo ( tRowID );
+	tNode.m_tRowID = tNode.m_tCandidates.Active() ? tNode.m_tCandidates.Next ( *tNode.m_pQword, tRowID ) : tNode.m_pQword->AdvanceTo ( tRowID );
 	while ( tNode.m_tRowID!=INVALID_ROWID )
 	{
 		if constexpr ( ROWID_LIMITS )
@@ -3153,7 +3191,7 @@ RowID_t ExtMultiAnd_T<USE_BM25,TEST_FIELDS,ROWID_LIMITS>::Advance ( int iNode, R
 		if ( tNode.FitsFields() )
 			break;
 		
-		tNode.m_tRowID = tNode.m_pQword->GetNextDoc().m_tRowID;
+		tNode.m_tRowID = tNode.m_tCandidates.Active() ? tNode.m_tCandidates.Next(*tNode.m_pQword) : tNode.m_pQword->GetNextDoc().m_tRowID;
 	}
 
 	return tNode.m_tRowID;
@@ -3517,6 +3555,7 @@ void ExtMultiAnd_T<USE_BM25,TEST_FIELDS,ROWID_LIMITS>::Reset ( const ISphQwordSe
 	for ( auto & i : m_dNodes )
 	{
 		i.m_tRowID = INVALID_ROWID;
+		i.m_tCandidates.Reset(tSetup.m_pMatchCandidates);
 		i.m_bHitsOver = false;
 		i.m_pQword->Reset ();
 		// need to track active nodes for every segment
@@ -6392,4 +6431,270 @@ void sphInterruptNow()
 bool sphInterrupted()
 {
 	return g_bInterruptNow;
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Opt-in candidate restriction. No posting or hitlist format changes.
+
+/// Check interruption and yield when needed, using this query's timer/warning state.
+/// No arguments; returns false after timeout, shutdown, cancellation or prior abort.
+bool MatchCandidates_t::Check()
+{
+	if ( m_bAborted )
+		return false;
+
+	const char * sWarning = nullptr;
+	if ( sph::TimeExceeded ( m_iMaxTimer ) )
+		sWarning = "query time exceeded max_query_time";
+	else if ( g_bInterruptNow )
+		sWarning = "Server shutdown in progress";
+	else if ( session::GetKilled() )
+		sWarning = "query was killed";
+
+	if ( sWarning )
+	{
+		m_bAborted = true;
+		if ( m_pWarning )
+			*m_pWarning = sWarning;
+		return false;
+	}
+
+	if ( Threads::Coro::RuntimeExceeded() )
+		Threads::Coro::RescheduleAndKeepCrashQuery();
+	return true;
+}
+
+/// Bind pCandidates (borrowed, nullable) and rewind this leaf's cursor.
+/// Returns nothing; call again when switching RAM segments or resetting a reader.
+void MatchCandidateCursor_t::Reset ( MatchCandidates_t * pCandidates )
+{
+	m_pCandidates = pCandidates;
+	m_iNext = 0;
+	m_tPosting = INVALID_ROWID;
+}
+
+/// No arguments; returns whether the bound chunk has a complete candidate set.
+bool MatchCandidateCursor_t::Active() const
+{
+	return m_pCandidates && m_pCandidates->m_bActive;
+}
+
+/// Advance to the first remaining candidate >= tRowID without reading postings.
+/// Requires a bound state; returns nothing and never rewinds the cursor.
+void MatchCandidateCursor_t::Hint ( RowID_t tRowID )
+{
+	const auto & dRows = m_pCandidates->m_dRows;
+	if ( m_iNext<dRows.GetLength() && dRows[m_iNext]<tRowID )
+		m_iNext = std::lower_bound ( dRows.Begin()+m_iNext, dRows.End(), tRowID ) - dRows.Begin();
+}
+
+/// Intersect tWord with active candidates at or above tMinRowID.
+/// Returns the next common row ID, or INVALID_ROWID on exhaustion/interruption;
+/// leaves tWord positioned there so existing field, hit and ranking code can run.
+RowID_t MatchCandidateCursor_t::Next ( ISphQword & tWord, RowID_t tMinRowID )
+{
+	assert ( Active() );
+	const auto & dRows = m_pCandidates->m_dRows;
+	Hint ( tMinRowID );
+	while ( m_iNext<dRows.GetLength() )
+	{
+		if ( !m_pCandidates->Check() )
+			break;
+
+		RowID_t tCandidate = dRows[m_iNext];
+		if ( m_tPosting==INVALID_ROWID || m_tPosting<tCandidate )
+		{
+			if ( !m_pCandidates->m_bSequential && !tWord.m_sWord.IsEmpty() )
+				m_tPosting = tWord.AdvanceTo(tCandidate);
+			else
+			{
+				int iRead = 0;
+				do
+				{
+					if ( !(iRead++ & 255) && !m_pCandidates->Check() )
+						return INVALID_ROWID;
+					m_tPosting = tWord.GetNextDoc().m_tRowID;
+				}
+				while ( m_tPosting<tCandidate );
+			}
+		}
+		if ( m_tPosting==INVALID_ROWID )
+			break;
+
+		if ( m_tPosting==tCandidate )
+		{
+			++m_iNext;
+			return tCandidate;
+		}
+
+		// An overshooting RAM posting must be reused, not consumed again.
+		Hint(m_tPosting);
+	}
+
+	m_iNext = dRows.GetLength();
+	return INVALID_ROWID;
+}
+
+// Materialize a bounded sorted prefix, then replay it through the existing outer
+// intersection. Overflow retains the pending source block and the untouched tail.
+class MatchCandidateReplay_c final : public RowidIterator_i
+{
+public:
+	explicit MatchCandidateReplay_c ( std::unique_ptr<RowidIterator_i> pSource, MatchCandidates_t & tCandidates );
+	bool HintRowID ( RowID_t tRowID ) override;
+	bool GetNextRowIdBlock ( RowIdBlock_t & dBlock ) override;
+	int64_t GetNumProcessed() const override;
+	void SetCutoff ( int iCutoff ) override;
+	bool WasCutoffHit() const override;
+	void AddDesc ( CSphVector<IteratorDesc_t> & dDesc ) const override;
+
+private:
+	std::unique_ptr<RowidIterator_i> m_pSource;
+	MatchCandidates_t & m_tCandidates;
+	RowIdBlock_t m_dPending;
+	int m_iNext = 0;
+};
+
+static std::atomic<int> g_iMatchCandidatesLimit { MatchCandidates_t::MAX_ROWS };
+
+/// No parameters; return the current per-daemon candidate row limit.
+int GetMatchCandidatesLimit()
+{
+	return g_iMatchCandidatesLimit.load(std::memory_order_relaxed);
+}
+
+/// Apply iRows atomically; return false with sError if outside the supported range.
+bool SetMatchCandidatesLimit ( int64_t iRows, CSphString & sError )
+{
+	if ( iRows<1 || iRows>MatchCandidates_t::MAX_CONFIGURED_ROWS )
+	{
+		sError.SetSprintf ( "match_by_candidates_limit must be between 1 and %d", MatchCandidates_t::MAX_CONFIGURED_ROWS );
+		return false;
+	}
+	g_iMatchCandidatesLimit.store ( (int)iRows, std::memory_order_relaxed );
+	return true;
+}
+
+/// Take ownership of sorted pSource and fill borrowed tCandidates up to its
+/// m_iMaxRows; construct replay state and activate only on complete exhaustion.
+MatchCandidateReplay_c::MatchCandidateReplay_c ( std::unique_ptr<RowidIterator_i> pSource, MatchCandidates_t & tCandidates )
+	: m_pSource ( std::move(pSource) ), m_tCandidates(tCandidates)
+{
+	while ( tCandidates.Check() )
+	{
+		RowIdBlock_t dBlock;
+		if ( !m_pSource->GetNextRowIdBlock(dBlock) )
+		{
+			tCandidates.m_bActive = true;
+			break;
+		}
+		if ( dBlock.GetLength()>tCandidates.m_iMaxRows-tCandidates.m_dRows.GetLength() )
+		{
+			// The source owns this block until its next GetNextRowIdBlock().
+			m_dPending = dBlock;
+			break;
+		}
+		// Grow only for collected rows. The hard cap bounds rounded-up capacity
+		// while small candidate sets avoid a large up-front allocation.
+		tCandidates.m_dRows.Append ( dBlock.Begin(), dBlock.GetLength() );
+	}
+}
+
+/// Skip replay/source rows below tRowID, preserving prefix/pending/tail order.
+/// Returns whether a row can remain at or beyond that lower bound.
+bool MatchCandidateReplay_c::HintRowID ( RowID_t tRowID )
+{
+	const auto & dRows = m_tCandidates.m_dRows;
+	if ( m_iNext<dRows.GetLength() )
+	{
+		if ( dRows[m_iNext]<tRowID )
+			m_iNext = std::lower_bound ( dRows.Begin()+m_iNext, dRows.End(), tRowID ) - dRows.Begin();
+		if ( m_iNext<dRows.GetLength() )
+			return true;
+	}
+	if ( !m_dPending.IsEmpty() )
+	{
+		auto * pNext = std::lower_bound ( m_dPending.Begin(), m_dPending.End(), tRowID );
+		m_dPending = RowIdBlock_t ( pNext, m_dPending.End()-pNext );
+		if ( !m_dPending.IsEmpty() )
+			return true;
+	}
+	return !m_tCandidates.m_bActive && m_pSource->HintRowID(tRowID);
+}
+
+/// Set dBlock to the next borrowed prefix, pending block, or source block.
+/// Returns false on exhaustion; a returned view is valid until the next advance.
+bool MatchCandidateReplay_c::GetNextRowIdBlock ( RowIdBlock_t & dBlock )
+{
+	auto & dRows = m_tCandidates.m_dRows;
+	if ( m_iNext<dRows.GetLength() )
+	{
+		int iCount = Min ( 512, dRows.GetLength()-m_iNext );
+		dBlock = RowIdBlock_t ( dRows.Begin()+m_iNext, iCount );
+		m_iNext += iCount;
+		return true;
+	}
+	if ( !m_dPending.IsEmpty() )
+	{
+		dBlock = m_dPending;
+		m_dPending = RowIdBlock_t();
+		return true;
+	}
+	return !m_tCandidates.m_bActive && m_pSource->GetNextRowIdBlock(dBlock);
+}
+
+/// No arguments; returns the underlying iterator's processed-row counter.
+int64_t MatchCandidateReplay_c::GetNumProcessed() const { return m_pSource->GetNumProcessed(); }
+/// Forward iCutoff to the source without truncating the buffered prefix; returns nothing.
+void MatchCandidateReplay_c::SetCutoff ( int iCutoff ) { m_pSource->SetCutoff(iCutoff); }
+/// No arguments; returns whether the underlying iterator reached its cutoff.
+bool MatchCandidateReplay_c::WasCutoffHit() const { return m_pSource->WasCutoffHit(); }
+/// Append the underlying iterator's descriptions to dDesc; returns nothing.
+void MatchCandidateReplay_c::AddDesc ( CSphVector<IteratorDesc_t> & dDesc ) const { m_pSource->AddDesc(dDesc); }
+
+/// Consume owned pIterator into query-local tCandidates and return its replay wrapper.
+/// On overflow restriction stays inactive and the wrapper preserves every source row.
+std::unique_ptr<RowidIterator_i> BufferMatchCandidates ( std::unique_ptr<RowidIterator_i> pIterator, MatchCandidates_t & tCandidates )
+{
+	return std::make_unique<MatchCandidateReplay_c> ( std::move(pIterator), tCandidates );
+}
+
+/// Record one chunk's candidate execution in tMeta, coalescing identical entries.
+/// sFallback is a reason string or nullptr for active restriction; returns nothing.
+void DescribeMatchCandidates ( CSphQueryResultMeta & tMeta, const char * sFallback )
+{
+	++tMeta.m_tIteratorStats.m_iTotal;
+	CSphString sType = sFallback ? SphSprintf ( "MatchByCandidatesFallback(%s)", sFallback ) : CSphString("MatchByCandidates");
+	for ( auto & tDesc : tMeta.m_tIteratorStats.m_dIterators )
+		if ( tDesc.m_sAttr=="@match" && tDesc.m_sType==sType )
+		{
+			++tDesc.m_iUsed;
+			return;
+		}
+	tMeta.m_tIteratorStats.m_dIterators.Add ( { "@match", sType } );
+}
+
+
+/// Intersect this payload's sorted cached hits with its active candidate rows.
+/// No arguments; returns nothing, compacts the cache once, and preserves corpus stats.
+template<bool ROWID_LIMITS>
+void ExtPayloadBase_T<ROWID_LIMITS>::FilterCandidates()
+{
+	const auto & dRows = m_pCandidates->m_dRows;
+	int iNext = 0;
+	int iOut = 0;
+	for ( int i=0; i<m_dCache.GetLength(); ++i )
+	{
+		if ( !(i & 255) && !m_pCandidates->Check() )
+			break;
+		RowID_t tRowID = m_dCache[i].m_tRowID;
+		while ( iNext<dRows.GetLength() && dRows[iNext]<tRowID )
+			++iNext;
+		if ( iNext==dRows.GetLength() )
+			break;
+		if ( dRows[iNext]==tRowID )
+			m_dCache[iOut++] = m_dCache[i];
+	}
+	m_dCache.Resize(iOut);
+	m_bCandidatesFiltered = true;
 }

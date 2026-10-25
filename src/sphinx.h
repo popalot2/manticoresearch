@@ -634,6 +634,7 @@ struct CSphQuery
 	CSphVector<FilterTreeItem_t>	m_dFilterTree;
 
 	CSphVector<IndexHint_t>			m_dIndexHints;	///< secondary index hints
+	bool							m_bMatchByCandidates = false; ///< restrict full-text streams to attribute candidates
 
 	JoinType_e		m_eJoinType = JoinType_e::NONE;	///< JOIN type
 	CSphString		m_sJoinIdx;						///< index to perform join on

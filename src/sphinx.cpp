@@ -293,9 +293,13 @@ template < bool INLINE_HITS, bool DISABLE_HITLIST_SEEK >
 class DiskIndexQword_c : public DiskIndexQwordTraits_c
 {
 public:
-	DiskIndexQword_c ( bool bUseMinibuffer, bool bExcluded, int64_t iIndexId )
+	// pCandidates and pCandidateDoclist are borrowed from the query setup, which
+	// outlives this word. A null state retains normal posting-reader behavior.
+	DiskIndexQword_c ( bool bUseMinibuffer, bool bExcluded, int64_t iIndexId, const MatchCandidates_t * pCandidates = nullptr, DataReaderFactory_c * pCandidateDoclist = nullptr )
 		: DiskIndexQwordTraits_c ( bUseMinibuffer, bExcluded )
 		, m_iIndexId ( iIndexId )
+		, m_pCandidates ( pCandidates )
+		, m_pCandidateDoclist ( pCandidateDoclist )
 	{}
 
 	~DiskIndexQword_c()
@@ -396,7 +400,16 @@ public:
 		if ( t.m_iOffset<=m_rdDoclist->GetPos() )
 			return false;
 
-		m_rdDoclist->SeekTo ( t.m_iOffset, -1 );
+		// Sparse candidate probes need a checkpoint, not the remainder of a
+		// common word's posting list. Reuse the expansion buffer only after
+		// activation so fallback keeps the normal allocation and refill policy.
+		bool bCandidates = m_pCandidates && m_pCandidates->m_bActive;
+		if ( bCandidates && m_pCandidateDoclist && !m_pDocsBuf && !m_pCandidateDoclist->GetMappedsize() )
+		{
+			m_pDocsBuf = m_dDoclistBuf;
+			SetDocReader(m_pCandidateDoclist);
+		}
+		m_rdDoclist->SeekTo ( t.m_iOffset, bCandidates ? MINIBUFFER_LEN : -1 );
 		m_tDoc.m_tRowID = t.m_tBaseRowIDPlus1-1;
 		m_uHitPosition = m_iHitlistPos = t.m_iBaseHitlistPos;
 
@@ -505,6 +518,8 @@ private:
 
 private:
 	int64_t m_iIndexId = 0;
+	const MatchCandidates_t * m_pCandidates = nullptr;
+	DataReaderFactory_c * m_pCandidateDoclist = nullptr;
 };
 
 
@@ -8906,6 +8921,9 @@ bool CSphIndex_VLN::SelectIteratorsFT ( const CSphQuery & tQuery, const CSphVect
 	if ( !dSIInfo.any_of ( []( const auto & tInfo ){ return tInfo.m_eType==SecondaryIndexType_e::LOOKUP || tInfo.m_eType==SecondaryIndexType_e::INDEX || tInfo.m_eType==SecondaryIndexType_e::ANALYZER; } ) )
 		return false;
 
+	if ( tQuery.m_bMatchByCandidates && !tQuery.HasKnn() && tQuery.m_eJoinType==JoinType_e::NONE )
+		return true; // retain the candidate-producing plan even if the usual FT cost wins
+
 	CSphVector<SecondaryIndexInfo_t> dSIInfoFilters { dSIInfo.GetLength() };
 	float fValuesAfterFilters = 1.0f;
 	ARRAY_FOREACH ( i, dSIInfo )
@@ -9284,6 +9302,8 @@ bool CSphIndex_VLN::MultiScan ( CSphQueryResult & tResult, const CSphQuery & tQu
 {
 	assert ( tArgs.m_iTag>=0 );
 	auto& tMeta = *tResult.m_pMeta;
+	if ( tQuery.m_bMatchByCandidates )
+		DescribeMatchCandidates ( tMeta, "no_match" );
 
 	// check if index is ready
 	if ( !m_bPassedAlloc )
@@ -9482,7 +9502,7 @@ ISphQword * DiskIndexQwordSetup_c::QwordSpawn ( const XQKeyword_t & tWord ) cons
 {
 	if ( !tWord.m_pPayload )
 	{
-		WITH_QWORD ( m_pIndex, false, Qword, return new Qword ( tWord.m_bExpanded, tWord.m_bExcluded, m_pIndex->GetIndexId() ) );
+		WITH_QWORD ( m_pIndex, false, Qword, return new Qword ( tWord.m_bExpanded, tWord.m_bExcluded, m_pIndex->GetIndexId(), m_pMatchCandidates, m_pDoclist ) );
 	} else
 	{
 		if ( m_pIndex->GetSettings().m_eHitFormat==SPH_HIT_FORMAT_INLINE )
@@ -12355,6 +12375,8 @@ static void SetupRowIdBoundaries ( const CSphVector<CSphFilterSettings> & dFilte
 }
 
 
+/// Run parsed tXQ against this disk index with tQuery/settings, dictionary,
+/// sorters, cache, args and deadline. Fill tResult; return query success.
 bool CSphIndex_VLN::ParsedMultiQuery ( const CSphQuery & tQuery, const QueryExecutionSettings_t & tQuerySettings, CSphQueryResult & tResult, const VecTraits_T<ISphMatchSorter *> & dSorters, const XQQuery_t & tXQ, DictRefPtr_c pDict, const CSphMultiQueryArgs & tArgs, CSphQueryNodeCache * pNodeCache, int64_t tmMaxTimer ) const
 {
 	assert ( !tQuery.m_sQuery.IsEmpty() && tQuery.m_eMode!=SPH_MATCH_FULLSCAN ); // scans must go through MultiScan()
@@ -12430,6 +12452,13 @@ bool CSphIndex_VLN::ParsedMultiQuery ( const CSphQuery & tQuery, const QueryExec
 
 	SwitchProfile ( pProfile, SPH_QSTATE_INIT );
 
+	MatchCandidates_t tCandidates;
+	tCandidates.m_iMaxTimer = tmMaxTimer;
+	tCandidates.m_pWarning = &tMeta.m_sWarning;
+	bool bUseCandidates = tQuery.m_bMatchByCandidates && !tQuery.HasKnn() && tQuery.m_eJoinType==JoinType_e::NONE;
+	if ( bUseCandidates )
+		tCandidates.m_iMaxRows = GetMatchCandidatesLimit();
+
 	// setup search terms
 	DiskIndexQwordSetup_c tTermSetup ( pDoclist, pHitlist, m_tSkiplists.GetReadPtr(), m_tSettings.m_iSkiplistBlockSize, true, RowID_t(m_iDocinfo) );
 
@@ -12440,11 +12469,12 @@ bool CSphIndex_VLN::ParsedMultiQuery ( const CSphQuery & tQuery, const QueryExec
 	tTermSetup.m_pWarning = &tMeta.m_sWarning;
 	tTermSetup.m_pCtx = &tCtx;
 	tTermSetup.m_pNodeCache = pNodeCache;
+	tTermSetup.m_pMatchCandidates = bUseCandidates ? &tCandidates : nullptr;
 	tTermSetup.m_bHasWideFields = ( m_tSchema.GetFieldsCount()>32 );
 	tMeta.m_bBigram = ( m_tSettings.m_eBigramIndex!=SPH_BIGRAM_NONE );
 
-	if ( HasForceHints ( tQuery.m_dIndexHints ) )
-		tCtx.m_bSkipQCache = true;
+	if ( tQuery.m_bMatchByCandidates || HasForceHints ( tQuery.m_dIndexHints ) )
+		tCtx.m_bSkipQCache = true; // cached matches cannot acknowledge candidate execution
 
 	// bind weights
 	tCtx.BindWeights ( tQuery, m_tSchema, tMeta.m_sWarning );
@@ -12519,16 +12549,35 @@ bool CSphIndex_VLN::ParsedMultiQuery ( const CSphQuery & tQuery, const QueryExec
 	if ( !bIsCacheRanker )
 	{
 		// Not using cache - spawn SI iterators if needed
-		tSpawned = SpawnIterators ( tQuery, dTransformedFilters, dJsonSITransforms, tCtx, tFlx, tMaxSorterSchema, dSorterSchemas, pModifiedMatchSchema, tMeta, iCutoff, tArgs.m_iTotalThreads, dFiltersAfterIterator, tArgs.m_bUseSICache, pRanker.get(), bKNNIteratorCreated );
+		// Candidate collection must see the entire stream, independent of the
+		// final result cutoff. The outer intersection still applies residual filters.
+		tSpawned = SpawnIterators ( tQuery, dTransformedFilters, dJsonSITransforms, tCtx, tFlx, tMaxSorterSchema, dSorterSchemas, pModifiedMatchSchema, tMeta, bUseCandidates ? -1 : iCutoff, tArgs.m_iTotalThreads, dFiltersAfterIterator, tArgs.m_bUseSICache, pRanker.get(), bKNNIteratorCreated );
 		pIterator = std::unique_ptr<RowidIterator_i> ( tSpawned.first );
 		if ( tSpawned.second )
 			return false;
 
 		if ( pIterator )
 		{
+			if ( bUseCandidates )
+			{
+				CSphScopedProfile tCollect ( pProfile, SPH_QSTATE_CANDIDATE_COLLECT );
+				pIterator = BufferMatchCandidates ( std::move(pIterator), tCandidates );
+			}
 			auto pIter = pIterator.get();
 			pRanker->ExtraData ( EXTRA_SET_ITERATOR, (void**)&pIter );
 		}
+	}
+
+	if ( tQuery.m_bMatchByCandidates )
+		DescribeMatchCandidates ( tMeta, tCandidates.m_bAborted ? "interrupted" : tCandidates.m_bActive ? nullptr : !bUseCandidates ? "knn_or_join" : pIterator ? "candidate_limit" : "no_iterator" );
+	if ( tCandidates.m_bAborted )
+	{
+		// An interrupted candidate prefix is incomplete, never an exact total.
+		tMeta.m_bTotalMatchesApprox = true;
+		tMeta.AddQueryTimeUs ( sphMicroTimer() - tmQueryStart );
+		tMeta.m_iCpuTime += sphTaskCpuTimer() - tmCpuQueryStart;
+		SwitchProfile ( pProfile, eOldState );
+		return true;
 	}
 
 	if ( !AddLateKNNDistFilter ( tQuery, bKNNIteratorCreated, tCtx, tFlx, tMeta ) )
@@ -12570,6 +12619,11 @@ bool CSphIndex_VLN::ParsedMultiQuery ( const CSphQuery & tQuery, const QueryExec
 	////////////////////
 
 	SwitchProfile ( pProfile, SPH_QSTATE_FINALIZE );
+	// A native leaf can notice interruption before reaching the candidate cursor,
+	// including on fallback. Recheck warnings before claiming totals; successful
+	// completion needs no extra interruption check or coroutine yield.
+	if ( tQuery.m_bMatchByCandidates )
+		tMeta.m_bTotalMatchesApprox |= tCandidates.m_bAborted || ( !tMeta.m_sWarning.IsEmpty() && !tCandidates.Check() );
 
 	if ( pIterator )
 	{

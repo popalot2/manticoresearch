@@ -22,6 +22,7 @@
 #include "minimize_aggr_result.h"
 #include "facetutils.h"
 #include "searchdsql.h"
+#include "sphinxsearch.h"
 
 #include "std/string.h"
 
@@ -960,6 +961,9 @@ bool SearchHandler_c::SubmitSuccess ( CSphVector<ISphMatchSorter *> & dSorters, 
 		tNRes.m_iMultiplier = iNumQueries;
 		tNRes.m_iCpuTime += tMqMeta.m_iCpuTime / iNumQueries;
 		tNRes.m_bTotalMatchesApprox |= tMqMeta.m_bTotalMatchesApprox;
+		// Shared rankers must acknowledge execution separately for each hinted result.
+		if ( m_dNQueries[iQuery].m_bMatchByCandidates )
+			tNRes.m_tIteratorStats.Merge(tMqMeta.m_tIteratorStats);
 
 		iCpuTime /= iNumQueries;
 	}
@@ -1463,6 +1467,7 @@ bool SearchHandler_c::CheckMultiQuery() const
 			( qCheck.m_eMode!=qFirst.m_eMode ) || // search mode
 			!HasSameRankerIntent ( qCheck, qFirst ) || // ranking mode
 			!HasSameBooleanModeIntent ( qCheck, qFirst ) || // implicit boolean operator mode
+			( qCheck.m_bMatchByCandidates!=qFirst.m_bMatchByCandidates ) || // execution hints must not leak across queries
 			( qCheck.m_dFilters.GetLength ()!=qFirst.m_dFilters.GetLength () ) || // attr filters count
 			( qCheck.m_dFilterTree.GetLength ()!=qFirst.m_dFilterTree.GetLength () ) ||
 			( qCheck.m_iCutoff!=qFirst.m_iCutoff ) || // cutoff
@@ -2065,7 +2070,8 @@ static void FinalizeFacetZeroes ( const VecTraits_T<CSphQuery> & dQueries, const
 	}
 }
 
-// one or more queries against one and same set of indexes
+/// Execute queries [iStart,iEnd) against their common index set, merging local/agent
+/// results and coalesced execution statistics into handler state; returns nothing.
 void SearchHandler_c::RunSubset ( int iStart, int iEnd )
 {
 	int iQueries = iEnd - iStart;
@@ -2298,6 +2304,10 @@ void SearchHandler_c::RunSubset ( int iStart, int iEnd )
 					tRes.m_iAgentFetchedDocs += tRemoteResult.m_iAgentFetchedDocs;
 					tRes.m_iAgentFetchedHits += tRemoteResult.m_iAgentFetchedHits;
 					tRes.m_iAgentFetchedSkips += tRemoteResult.m_iAgentFetchedSkips;
+					tRes.m_tIteratorStats.Merge(tRemoteResult.m_tIteratorStats);
+					// Absence of acknowledgment means the agent may be an older build.
+					if ( m_dNQueries[iRes].m_bMatchByCandidates && !tRemoteResult.m_tIteratorStats.m_iTotal )
+							DescribeMatchCandidates ( tRes, "agent_not_acknowledged" );
 
 					if ( pDistr )
 					{

@@ -8890,7 +8890,9 @@ static bool DoFullScanQuery ( const RtSegVec_c & dRamChunks, const ISphSchema & 
 }
 
 
-static void PerformFullTextSearch ( const RtSegVec_c & dRamChunks, RtQwordSetup_t & tTermSetup, ISphRanker * pRanker, int iIndexWeight, int iCutoff, QueryProfile_c * pProfiler, CSphQueryContext & tCtx, VecTraits_T<ISphMatchSorter*> & dSorters )
+static const char * CollectRamMatchCandidates ( const RtSegment_t & tSeg, const ISphSchema & tSchema, const CSphQueryContext & tCtx, MatchCandidates_t & tCandidates );
+
+static void PerformFullTextSearch ( const RtSegVec_c & dRamChunks, RtQwordSetup_t & tTermSetup, ISphRanker * pRanker, int iIndexWeight, int iCutoff, QueryProfile_c * pProfiler, CSphQueryContext & tCtx, VecTraits_T<ISphMatchSorter*> & dSorters, CSphQueryResultMeta & tMeta )
 {
 	if ( !iCutoff )
 		return;
@@ -8904,7 +8906,8 @@ static void PerformFullTextSearch ( const RtSegVec_c & dRamChunks, RtQwordSetup_
 		SwitchProfile ( pProfiler, SPH_QSTATE_INIT_SEGMENT );
 
 		tTermSetup.SetSegment ( iSeg );
-		pRanker->Reset ( tTermSetup );
+		if ( !tTermSetup.m_pMatchCandidates )
+			pRanker->Reset ( tTermSetup );
 
 		// for lookups to work
 		tCtx.m_pIndexData = pSeg;
@@ -8922,6 +8925,29 @@ static void PerformFullTextSearch ( const RtSegVec_c & dRamChunks, RtQwordSetup_
 
 		if ( tCtx.m_pFilter )
 			tCtx.m_pFilter->SetColumnar(pColumnar);
+
+		if ( tTermSetup.m_pMatchCandidates )
+		{
+			// Collect with this segment's native attribute/blob/columnar storage
+			// before Reset() rebuilds wildcard caches and rewinds leaf cursors.
+			auto & tCandidates = *tTermSetup.m_pMatchCandidates;
+			const char * sFallback;
+			{
+				CSphScopedProfile tCollect ( pProfiler, SPH_QSTATE_CANDIDATE_COLLECT );
+				sFallback = CollectRamMatchCandidates ( *pSeg, tTermSetup.m_pIndex->GetMatchSchema(), tCtx, tCandidates );
+			}
+			DescribeMatchCandidates ( tMeta, sFallback );
+			if ( tCandidates.m_bAborted )
+			{
+				tMeta.m_bTotalMatchesApprox = true;
+				break;
+			}
+		}
+		else if ( tCtx.m_tQuery.m_bMatchByCandidates )
+			DescribeMatchCandidates ( tMeta, "knn_or_join" );
+
+		if ( tTermSetup.m_pMatchCandidates )
+			pRanker->Reset ( tTermSetup );
 
 		// storing segment in matches tag for finding strings attrs offset later, biased against default zero
 		int iTag = iSeg+1;
@@ -8993,6 +9019,9 @@ static void PerformFullTextSearch ( const RtSegVec_c & dRamChunks, RtQwordSetup_
 	}
 }
 
+/// Search dRamChunks using tQuery/settings/args, tParsed, tMaxSorterSchema and the
+/// pool/stack sizes; update dSorters and tMeta through tTermSetup, tCtx and pProfiler.
+/// pSorter optionally supplies extra data. Return success, restoring borrowed candidate state.
 static bool DoFullTextSearch ( const RtSegVec_c & dRamChunks, const ISphSchema & tMaxSorterSchema, const CSphQuery & tQuery, const QueryExecutionSettings_t & tQuerySettings, const CSphMultiQueryArgs & tArgs, int iMatchPoolSize, int iStackNeed, RtQwordSetup_t & tTermSetup, QueryProfile_c * pProfiler, CSphQueryContext & tCtx, VecTraits_T<ISphMatchSorter*> & dSorters, XQQuery_t & tParsed, CSphQueryResultMeta & tMeta, ISphMatchSorter * pSorter )
 {
 	// set zonespanlist settings
@@ -9001,6 +9030,18 @@ static bool DoFullTextSearch ( const RtSegVec_c & dRamChunks, const ISphSchema &
 		iStackNeed = -1;
 
 	return Threads::Coro::ContinueBool ( iStackNeed, [&] {
+
+	MatchCandidates_t tCandidates;
+	tCandidates.m_iMaxTimer = tTermSetup.m_iMaxTimer;
+	tCandidates.m_bSequential = true; // RAM has no disk-style posting checkpoints
+	tCandidates.m_pWarning = &tMeta.m_sWarning;
+	auto * pPreviousCandidates = tTermSetup.m_pMatchCandidates;
+	AT_SCOPE_EXIT ( [&tTermSetup, pPreviousCandidates] { tTermSetup.m_pMatchCandidates = pPreviousCandidates; } );
+	if ( tQuery.m_bMatchByCandidates && !tQuery.HasKnn() && tQuery.m_eJoinType==JoinType_e::NONE )
+	{
+		tCandidates.m_iMaxRows = GetMatchCandidatesLimit();
+		tTermSetup.m_pMatchCandidates = &tCandidates;
+	}
 
 	// setup query
 	// must happen before index-level reject, in order to build proper keyword stats
@@ -9032,7 +9073,10 @@ static bool DoFullTextSearch ( const RtSegVec_c & dRamChunks, const ISphSchema &
 
 		// do searching
 		int iCutoff = ApplyImplicitCutoff ( tQuery, dSorters, true );
-		PerformFullTextSearch ( dRamChunks, tTermSetup, pRanker.get (), tArgs.m_iIndexWeight, iCutoff, pProfiler, tCtx, dSorters );
+		PerformFullTextSearch ( dRamChunks, tTermSetup, pRanker.get (), tArgs.m_iIndexWeight, iCutoff, pProfiler, tCtx, dSorters, tMeta );
+		// Native leaf timeout checks also run on fallback, before candidate checks.
+		if ( tQuery.m_bMatchByCandidates )
+			tMeta.m_bTotalMatchesApprox |= tCandidates.m_bAborted || ( !tMeta.m_sWarning.IsEmpty() && !tCandidates.Check() );
 	}
 
 	if ( !FinalExpressionCalculation ( tCtx, dRamChunks, dSorters, tArgs.m_bFinalizeSorters, tMeta ) )
@@ -9400,7 +9444,11 @@ bool RtIndex_c::MultiQuery ( CSphQueryResult & tResult, const CSphQuery & tQuery
 
 	bool bResult;
 	if ( bParsedFullscan )
+	{
+		if ( tQueryToRun.m_bMatchByCandidates )
+			DescribeMatchCandidates ( tMeta, "no_match" );
 		bResult = DoFullScanQuery ( tGuard.m_dRamSegs, tMaxSorterSchema, tQueryToRun, tArgs, m_iStride, tmMaxTimer, pProfiler, tCtx, dSorters, tMeta );
+	}
 	else
 	{
 		CSphMultiQueryArgs tFTArgs ( tArgs.m_iIndexWeight );
@@ -13654,4 +13702,69 @@ void RtIndex_c::FinishUpdateEmbeddingState ( ExtUpdState_t & tState )
 bool IsModelBackedEmbedding ( const AttrAddRemoveCtx_t & tCtx )
 {
 	return ( tCtx.m_eType==SPH_ATTR_FLOAT_VECTOR && !!( tCtx.m_uFlags & CSphColumnInfo::ATTR_INDEXED_KNN ) && !tCtx.m_tKNNModel.m_sModelName.empty() );
+}
+
+
+/// Collect live row IDs from tSeg using safe native filters from tCtx and tSchema.
+/// Writes tCandidates, activating it only when complete; returns nullptr on success
+/// or a static fallback reason. Native and residual filters remain in the normal chain.
+/// User variables stay in the original filter, preserving its already-bound snapshot.
+static const char * CollectRamMatchCandidates ( const RtSegment_t & tSeg, const ISphSchema & tSchema, const CSphQueryContext & tCtx, MatchCandidates_t & tCandidates )
+{
+	tCandidates.m_bActive = false;
+	tCandidates.m_dRows.Resize(0);
+	const auto & tQuery = tCtx.m_tQuery;
+	CSphVector<CSphFilterSettings> dFilters;
+	for ( const auto & tFilter : tQuery.m_dFilters )
+	{
+		const auto * pAttr = tSchema.GetAttr(tFilter.m_sAttrName.cstr());
+		bool bNative = pAttr && !pAttr->m_pExpr && !tFilter.m_bOptional
+			&& tFilter.m_eType!=SPH_FILTER_EXPRESSION && tFilter.m_eType!=SPH_FILTER_USERVAR;
+		if ( !bNative && !tQuery.m_dFilterTree.IsEmpty() )
+			return "unsafe_filter_tree";
+		if ( bNative )
+			dFilters.Add(tFilter);
+	}
+	if ( dFilters.IsEmpty() )
+		return "no_native_prefilter";
+
+	CreateFilterContext_t tFlx;
+	tFlx.m_pFilters = &dFilters;
+	tFlx.m_pFilterTree = tQuery.m_dFilterTree.IsEmpty() ? nullptr : &tQuery.m_dFilterTree;
+	tFlx.m_pMatchSchema = &tSchema;
+	tFlx.m_pIndexSchema = &tSchema;
+	tFlx.m_pBlobPool = tSeg.m_dBlobs.Begin();
+	tFlx.m_pColumnar = tSeg.m_pColumnar.get();
+	tFlx.m_eCollation = tQuery.m_eCollation;
+	tFlx.m_bScan = true;
+	CSphString sError, sWarning;
+	CSphVector<CSphFilterSettings> dTransformed;
+	CSphVector<FilterTreeItem_t> dTree;
+	std::unique_ptr<ISphSchema> pModifiedSchema;
+	// Reuse the normal UUID normalization and native filter fixups. A dynamic
+	// expression schema still belongs to the normal post-MATCH filter stage.
+	if ( !TransformFilters ( tFlx, dTransformed, dTree, pModifiedSchema, {}, sError ) || pModifiedSchema )
+		return "prefilter_unavailable";
+	tFlx.m_pFilters = &dTransformed;
+	tFlx.m_pFilterTree = dTree.IsEmpty() ? nullptr : &dTree;
+	if ( !sphCreateFilters ( tFlx, sError, sWarning ) || !tFlx.m_pFilter || tFlx.m_pWeightFilter )
+		return "prefilter_unavailable";
+
+	CSphMatch tMatch;
+	tMatch.Reset(0);
+	int iChecked = 0;
+	for ( RowID_t tRowID : RtLiveRows_c(tSeg) )
+	{
+		if ( !(iChecked++ & 255) && !tCandidates.Check() )
+			return "interrupted";
+		tMatch.m_tRowID = tRowID;
+		tMatch.m_pStatic = tSeg.GetDocinfoByRowID(tRowID);
+		if ( !tFlx.m_pFilter->Eval(tMatch) )
+			continue;
+		if ( tCandidates.m_dRows.GetLength()==tCandidates.m_iMaxRows )
+			return "candidate_limit";
+		tCandidates.m_dRows.Add(tRowID);
+	}
+	tCandidates.m_bActive = true;
+	return nullptr;
 }

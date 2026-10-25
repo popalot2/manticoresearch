@@ -1190,6 +1190,7 @@ static KeyDesc_t g_dKeysSearchd[] =
 	{ "pseudo_sharding",		0, nullptr },
 	{ "optimize_cutoff",		0, nullptr },
 	{ "secondary_indexes",		0, nullptr },
+	{ "match_by_candidates_limit", 0, nullptr },
 	{ "accurate_aggregation",	0, nullptr },
 	{ "distinct_precision_threshold", 0, nullptr },
 	{ "preopen_tables",			0, nullptr },

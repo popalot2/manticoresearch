@@ -87,6 +87,7 @@
 %token	TOK_HAVING
 %token	TOK_MEDIAN_ABSOLUTE_DEVIATION
 %token	TOK_HINT_SECONDARY
+%token	TOK_HINT_MATCH_BY_CANDIDATES
 %token	TOK_HINT_NO_SECONDARY
 %token	TOK_HINT_DOCID
 %token	TOK_HINT_NO_DOCID
@@ -1539,7 +1540,9 @@ hint_attr_list:
 	;
 
 hint_item:           
-	TOK_HINT_SECONDARY '(' hint_attr_list ')'
+	/* Execution hint takes no attribute list and can coexist with index hints. */
+	TOK_HINT_MATCH_BY_CANDIDATES { pParser->SetMatchByCandidates(); }
+	| TOK_HINT_SECONDARY '(' hint_attr_list ')'
 		{
 			pParser->AddIndexHint ( SecondaryIndexType_e::INDEX, true, $3 );
 		}

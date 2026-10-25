@@ -58,31 +58,35 @@ FLOAT_CONSTANT      {INT}\.{INT}?{EXP}?|{INT}?\.{INT}{EXP}|{INT}{EXP}
 %option case-insensitive
 %option batch
 %option align
+ /* Restore the enclosing INITIAL/HINT state after comments and quoted subkeys. */
+%option stack noyy_top_state
 
 %x ccomment
 %x BACKTICK
+ /* Inclusive state: keep existing hint tokens and allow this name as an identifier elsewhere. */
+%s HINT
 
 %%
 
-"/*"         		{ BLOCK_START; BEGIN(ccomment); }
-<ccomment>"*/"		{ BLOCK_END; BEGIN(INITIAL); lvalp->m_iEnd-=2; pParser->AddComment(lvalp); }
+"/*"         		{ BLOCK_START; yy_push_state ( ccomment, yyscanner ); }
+<ccomment>"*/"		{ BLOCK_END; yy_pop_state ( yyscanner ); lvalp->m_iEnd-=2; pParser->AddComment(lvalp); }
 <ccomment>[^*\n]+
 <ccomment>"*"[^/]
 <ccomment>"\n"
 
 
-\.{SPACE}*`	           	{ BLOCK_START; BEGIN (BACKTICK); }
+\.{SPACE}*`	           	{ BLOCK_START; yy_push_state ( BACKTICK, yyscanner ); }
 <BACKTICK>[^\n\\`]+		/* eat everything except \n, \, ` */
 <BACKTICK>\\[^\n]		/* eat one symbol after \ (aka escaping) except \n  */
 <BACKTICK>`				{
 							BLOCK_END;
-							BEGIN(INITIAL);
+							yy_pop_state ( yyscanner );
 							return TOK_BACKTICKED_SUBKEY;
 						}
 
 <BACKTICK>\n			|	/* terminate on \n or EOF inside unclosed backtick */
 <BACKTICK><<EOF>>		{
-							BEGIN(INITIAL);
+							yy_pop_state ( yyscanner );
 							return -1;
 						}
 
@@ -206,6 +210,7 @@ FLOAT_CONSTANT      {INT}\.{INT}?{EXP}?|{INT}?\.{INT}{EXP}|{INT}{EXP}
 "SCROLL"			{ YYSTOREBOUNDS; return TOK_SCROLL; }
 "SECOND"			{ YYSTOREBOUNDS; return TOK_SECOND; }
 "SECONDARYINDEX"	{ YYSTOREBOUNDS; return TOK_HINT_SECONDARY; }
+<HINT>"MATCHBYCANDIDATES" { YYSTOREBOUNDS; return TOK_HINT_MATCH_BY_CANDIDATES; }
 "SELECT"			{ YYSTOREBOUNDS; return TOK_SELECT; }
 "SEPARATOR"			{ YYSTOREBOUNDS; return TOK_SEPARATOR; }
 "SET"				{ YYSTOREBOUNDS; return TOK_SET; }
@@ -250,8 +255,8 @@ FLOAT_CONSTANT      {INT}\.{INT}?{EXP}?|{INT}?\.{INT}{EXP}|{INT}{EXP}
 ">="				{ YYSTOREBOUNDS; return TOK_GTE; }
 ":="				{ YYSTOREBOUNDS; return '='; }
 
-"/*+"				{ YYSTOREBOUNDS; return TOK_HINT_OPEN; }
-"*/"				{ YYSTOREBOUNDS; return TOK_HINT_CLOSE; }
+"/*+"				{ YYSTOREBOUNDS; BEGIN(HINT); return TOK_HINT_OPEN; }
+"*/"				{ YYSTOREBOUNDS; BEGIN(INITIAL); return TOK_HINT_CLOSE; }
 
 '([^'\\]|\\.|\\\\)*'			{ YYSTOREBOUNDS; pParser->m_pLastTokenStart = yytext; lvalp->SetValueInt ( ( (SphAttr_t)lvalp->m_iStart<<32 ) | ( lvalp->m_iEnd-lvalp->m_iStart ) ); return TOK_QUOTED_STRING; }
 

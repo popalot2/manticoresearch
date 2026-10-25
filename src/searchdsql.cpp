@@ -395,6 +395,7 @@ public:
 	void			PushQuery ();
 
 	void			AddIndexHint ( SecondaryIndexType_e eType, bool bForce, const SqlNode_t & tValue );
+	void			SetMatchByCandidates();
 	void			AddItem ( SqlNode_t * pExpr, ESphAggrFunc eFunc=SPH_AGGR_NONE, SqlNode_t * pStart=NULL, SqlNode_t * pEnd=NULL );
 	void			AddGroupConcatPlainItem ( SqlNode_t * pExpr, const SqlNode_t & tSeparator, SqlNode_t * pStart, SqlNode_t * pEnd );
 	void			BeginGroupConcatOrder ();
@@ -2926,6 +2927,7 @@ static bool SetupFacets ( CSphVector<SqlStmt_t> & dStmt, CSphString & sError )
 			tStmt.m_tQuery.m_sIndexes	= tHeadQuery.m_sIndexes;
 			tStmt.m_tQuery.m_sSelect	= tStmt.m_tQuery.m_sFacetBy;
 			tStmt.m_tQuery.m_sQuery		= tHeadQuery.m_sQuery;
+			tStmt.m_tQuery.m_bMatchByCandidates = tHeadQuery.m_bMatchByCandidates; // facets execute the same hinted search
 			tStmt.m_tQuery.m_iMaxMatches = tHeadQuery.m_iMaxMatches;
 			tStmt.m_tQuery.m_dKnnSettings= tHeadQuery.m_dKnnSettings;
 			tStmt.m_tQuery.m_bHybridSearch = tHeadQuery.m_bHybridSearch;
@@ -3702,4 +3704,11 @@ bool RouteToUser ( const char * szMessage, const char * pLastTokenStart )
 	// unrelated CREATE/DROP TABLE/CLUSTER should be routed to DDL parser
 	// for canonical diagnostics and Buddy fallback
 	return AtTokenStart ( pLastTokenStart, "table" ) || AtTokenStart ( pLastTokenStart, "cluster" );
+}
+
+/// Enable the argument-free hint on the parser's current query.
+/// No arguments; returns nothing. Ordinary identifiers never call this setter.
+void SqlParser_c::SetMatchByCandidates()
+{
+	m_pQuery->m_bMatchByCandidates = true;
 }
